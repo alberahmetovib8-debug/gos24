@@ -12,8 +12,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ================= КОНФИГ =================
-BOT_TOKEN = "8602357349:AAEID1YFdPCzMg0wbvg6tNXtQBpjpCyYXhU"  # ЗАМЕНИ!!!
-ADMIN_IDS = [8315613104]  # ЗАМЕНИ!!!
+BOT_TOKEN = "8220363263:AAErJ6PfZh037WJsxFG5YaovLswFmkbqD7Q"
+ADMIN_IDS = [8315613104]
 
 # ================= БАЗА ДАННЫХ =================
 conn = sqlite3.connect("profit_bot.db", check_same_thread=False)
@@ -24,19 +24,10 @@ CREATE TABLE IF NOT EXISTS workers (
     telegram_id INTEGER PRIMARY KEY,
     full_name TEXT,
     balance_usd REAL DEFAULT 0,
-    price_ozon REAL DEFAULT 0.5,
-    price_ypay REAL DEFAULT 0.5,
-    price_logi REAL DEFAULT 0.5,
-    total_ozon INTEGER DEFAULT 0,
-    total_ypay INTEGER DEFAULT 0,
-    total_logi INTEGER DEFAULT 0,
-    daily_ozon INTEGER DEFAULT 0,
-    daily_ypay INTEGER DEFAULT 0,
-    daily_logi INTEGER DEFAULT 0,
-    bonus_4 INTEGER DEFAULT 0,
-    bonus_6 INTEGER DEFAULT 0,
-    bonus_10 INTEGER DEFAULT 0,
-    bonus_date TEXT
+    price_per_screenshot REAL DEFAULT 0.5,
+    total_screenshots INTEGER DEFAULT 0,
+    daily_screenshots INTEGER DEFAULT 0,
+    last_bonus_date TEXT
 )
 """)
 
@@ -44,9 +35,9 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS screenshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     worker_id INTEGER,
-    platform TEXT,
     file_id TEXT,
-    status TEXT DEFAULT 'pending'
+    status TEXT DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """)
 conn.commit()
@@ -56,569 +47,523 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+
 # ================= FSM =================
-class AddWorker(StatesGroup):
-    get_id = State()
-    get_ozon = State()
-    get_ypay = State()
-    get_logi = State()
+class AddWorkerState(StatesGroup):
+    waiting_for_id = State()
+    waiting_for_price = State()
 
-class SetPrice(StatesGroup):
-    get_id = State()
-    get_platform = State()
-    get_price = State()
 
-class AddBalance(StatesGroup):
-    get_id = State()
-    get_amount = State()
+class SetPriceState(StatesGroup):
+    waiting_for_worker_id = State()
+    waiting_for_new_price = State()
 
-class RemoveBalance(StatesGroup):
-    get_id = State()
-    get_amount = State()
 
-class EditName(StatesGroup):
-    get_id = State()
-    get_name = State()
+class AddBalanceState(StatesGroup):
+    waiting_for_worker_id = State()
+    waiting_for_amount = State()
 
-class SendScreenshot(StatesGroup):
-    get_platform = State()
-    get_photo = State()
+
+class RemoveBalanceState(StatesGroup):
+    waiting_for_worker_id = State()
+    waiting_for_amount = State()
+
+
+class EditNameState(StatesGroup):
+    waiting_for_worker_id = State()
+    waiting_for_new_name = State()
+
 
 # ================= ФУНКЦИИ =================
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-def get_worker(uid):
-    cursor.execute("SELECT * FROM workers WHERE telegram_id = ?", (uid,))
+
+def get_worker(telegram_id):
+    cursor.execute("SELECT * FROM workers WHERE telegram_id = ?", (telegram_id,))
     return cursor.fetchone()
 
-def get_all_workers():
-    cursor.execute("SELECT telegram_id, full_name, balance_usd, price_ozon, price_ypay, price_logi, total_ozon, total_ypay, total_logi, daily_ozon, daily_ypay, daily_logi FROM workers")
-    return cursor.fetchall()
 
-def add_worker(uid, name, p_ozon, p_ypay, p_logi):
+def add_worker(telegram_id, full_name, price):
     today = date.today().isoformat()
-    cursor.execute("INSERT INTO workers (telegram_id, full_name, price_ozon, price_ypay, price_logi, bonus_date) VALUES (?, ?, ?, ?, ?, ?)",
-                   (uid, name, p_ozon, p_ypay, p_logi, today))
+    cursor.execute(
+        "INSERT OR REPLACE INTO workers (telegram_id, full_name, price_per_screenshot, balance_usd, total_screenshots, daily_screenshots, last_bonus_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (telegram_id, full_name, price, 0, 0, 0, today))
     conn.commit()
 
-def update_name(uid, new_name):
-    cursor.execute("UPDATE workers SET full_name = ? WHERE telegram_id = ?", (new_name, uid))
+
+def update_worker_price(telegram_id, new_price):
+    cursor.execute("UPDATE workers SET price_per_screenshot = ? WHERE telegram_id = ?", (new_price, telegram_id))
     conn.commit()
 
-def update_price(uid, platform, price):
-    if platform == "ozon":
-        cursor.execute("UPDATE workers SET price_ozon = ? WHERE telegram_id = ?", (price, uid))
-    elif platform == "ypay":
-        cursor.execute("UPDATE workers SET price_ypay = ? WHERE telegram_id = ?", (price, uid))
-    else:
-        cursor.execute("UPDATE workers SET price_logi = ? WHERE telegram_id = ?", (price, uid))
+
+def update_worker_name(telegram_id, new_name):
+    cursor.execute("UPDATE workers SET full_name = ? WHERE telegram_id = ?", (new_name, telegram_id))
     conn.commit()
 
-def add_balance(uid, amount):
-    cursor.execute("UPDATE workers SET balance_usd = balance_usd + ? WHERE telegram_id = ?", (amount, uid))
+
+def add_balance(telegram_id, amount):
+    cursor.execute("UPDATE workers SET balance_usd = balance_usd + ? WHERE telegram_id = ?", (amount, telegram_id))
     conn.commit()
 
-def remove_balance(uid, amount):
-    cursor.execute("UPDATE workers SET balance_usd = balance_usd - ? WHERE telegram_id = ?", (amount, uid))
+
+def remove_balance(telegram_id, amount):
+    """Списывает баланс (уменьшает)"""
+    cursor.execute("UPDATE workers SET balance_usd = balance_usd - ? WHERE telegram_id = ?", (amount, telegram_id))
     conn.commit()
 
-def inc_screenshot(uid, platform):
-    if platform == "ozon":
-        cursor.execute("UPDATE workers SET total_ozon = total_ozon + 1, daily_ozon = daily_ozon + 1 WHERE telegram_id = ?", (uid,))
-    elif platform == "ypay":
-        cursor.execute("UPDATE workers SET total_ypay = total_ypay + 1, daily_ypay = daily_ypay + 1 WHERE telegram_id = ?", (uid,))
-    else:
-        cursor.execute("UPDATE workers SET total_logi = total_logi + 1, daily_logi = daily_logi + 1 WHERE telegram_id = ?", (uid,))
+
+def increment_screenshots(telegram_id):
+    cursor.execute(
+        "UPDATE workers SET total_screenshots = total_screenshots + 1, daily_screenshots = daily_screenshots + 1 WHERE telegram_id = ?",
+        (telegram_id,))
     conn.commit()
 
-def get_price(worker, platform):
-    if platform == "ozon":
-        return worker[3]
-    elif platform == "ypay":
-        return worker[4]
-    else:
-        return worker[5]
 
-def check_bonus(uid):
-    worker = get_worker(uid)
+def reset_daily_stats():
+    today = date.today().isoformat()
+    cursor.execute("UPDATE workers SET daily_screenshots = 0, last_bonus_date = ?", (today,))
+    conn.commit()
+
+
+def check_and_give_bonuses(telegram_id):
+    worker = get_worker(telegram_id)
     if not worker:
         return ""
-    
-    today = date.today().isoformat()
-    daily_total = worker[9] + worker[10] + worker[11]
+    daily_count = worker[5]
+    last_bonus = worker[6] or ""
     messages = []
-    
-    if worker[15] != today:
-        cursor.execute("UPDATE workers SET bonus_4 = 0, bonus_6 = 0, bonus_10 = 0, bonus_date = ? WHERE telegram_id = ?", (today, uid))
+
+    if daily_count >= 10 and "bonus_10" not in last_bonus:
+        add_balance(telegram_id, 8)
+        cursor.execute("UPDATE workers SET last_bonus_date = last_bonus_date || ',bonus_10' WHERE telegram_id = ?",
+                       (telegram_id,))
         conn.commit()
-        worker = get_worker(uid)
-    
-    if daily_total >= 10 and worker[14] == 0:
-        add_balance(uid, 8)
-        cursor.execute("UPDATE workers SET bonus_10 = 1 WHERE telegram_id = ?", (uid,))
+        messages.append("🎉 Бонус за 10 скриншотов за сегодня: +8 $")
+    if daily_count >= 6 and "bonus_6" not in last_bonus:
+        add_balance(telegram_id, 6)
+        cursor.execute("UPDATE workers SET last_bonus_date = last_bonus_date || ',bonus_6' WHERE telegram_id = ?",
+                       (telegram_id,))
         conn.commit()
-        messages.append("🎉 Бонус за 10 скриншотов: +8$")
-    
-    if daily_total >= 6 and worker[13] == 0:
-        add_balance(uid, 6)
-        cursor.execute("UPDATE workers SET bonus_6 = 1 WHERE telegram_id = ?", (uid,))
+        messages.append("🎉 Бонус за 6 скриншотов за сегодня: +6 $")
+    if daily_count >= 4 and "bonus_4" not in last_bonus:
+        add_balance(telegram_id, 5)
+        cursor.execute("UPDATE workers SET last_bonus_date = last_bonus_date || ',bonus_4' WHERE telegram_id = ?",
+                       (telegram_id,))
         conn.commit()
-        messages.append("🎉 Бонус за 6 скриншотов: +6$")
-    
-    if daily_total >= 4 and worker[12] == 0:
-        add_balance(uid, 5)
-        cursor.execute("UPDATE workers SET bonus_4 = 1 WHERE telegram_id = ?", (uid,))
-        conn.commit()
-        messages.append("🎉 Бонус за 4 скриншота: +5$")
-    
+        messages.append("🎉 Бонус за 4 скриншота за сегодня: +5 $")
     return "\n".join(messages)
 
-def save_screenshot(uid, platform, file_id):
-    cursor.execute("INSERT INTO screenshots (worker_id, platform, file_id) VALUES (?, ?, ?)", (uid, platform, file_id))
+
+def save_screenshot(worker_id, file_id):
+    cursor.execute("INSERT INTO screenshots (worker_id, file_id, status) VALUES (?, ?, 'pending')",
+                   (worker_id, file_id))
     conn.commit()
     return cursor.lastrowid
 
-def get_pending(uid, platform):
-    cursor.execute("SELECT id FROM screenshots WHERE worker_id = ? AND platform = ? AND status = 'pending' ORDER BY id DESC LIMIT 1", (uid, platform))
-    return cursor.fetchone()
 
-def approve_screenshot(sid):
-    cursor.execute("UPDATE screenshots SET status = 'approved' WHERE id = ?", (sid,))
+def approve_screenshot(screenshot_id):
+    cursor.execute("UPDATE screenshots SET status = 'approved' WHERE id = ?", (screenshot_id,))
     conn.commit()
 
-def reject_screenshot(sid):
-    cursor.execute("UPDATE screenshots SET status = 'rejected' WHERE id = ?", (sid,))
+
+def reject_screenshot(screenshot_id):
+    cursor.execute("UPDATE screenshots SET status = 'rejected' WHERE id = ?", (screenshot_id,))
     conn.commit()
+
+
+def get_all_workers():
+    cursor.execute(
+        "SELECT telegram_id, full_name, balance_usd, price_per_screenshot, total_screenshots, daily_screenshots FROM workers")
+    return cursor.fetchall()
+
+
+def get_pending_screenshots_count(worker_id=None):
+    if worker_id:
+        cursor.execute("SELECT COUNT(*) FROM screenshots WHERE worker_id = ? AND status = 'pending'", (worker_id,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM screenshots WHERE status = 'pending'")
+    return cursor.fetchone()[0]
+
 
 # ================= КЛАВИАТУРЫ =================
-def main_keyboard(is_admin_user):
-    btns = [
-        [KeyboardButton(text="👤 Мой профиль")],
-        [KeyboardButton(text="📸 Отправить скриншот")]
-    ]
+def get_main_keyboard(is_admin_user):
+    buttons = [[KeyboardButton(text="👤 Мой профиль")], [KeyboardButton(text="📸 Отправить скриншот")]]
     if is_admin_user:
-        btns.append([KeyboardButton(text="⚙️ Админ-панель")])
-    return ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True)
+        buttons.append([KeyboardButton(text="⚙️ Админ-панель")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def platform_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🛍️ Ozon"), KeyboardButton(text="💳 YPay")],
-            [KeyboardButton(text="📦 ЛОГИ"), KeyboardButton(text="◀️ Назад")]
-        ],
-        resize_keyboard=True
-    )
 
-def admin_keyboard():
+def get_admin_panel_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить работника", callback_data="admin_add")],
-        [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="admin_name")],
-        [InlineKeyboardButton(text="💰 Изменить цену", callback_data="admin_price")],
-        [InlineKeyboardButton(text="🏦 Пополнить баланс", callback_data="admin_add_bal")],
-        [InlineKeyboardButton(text="📉 Списать баланс", callback_data="admin_rem_bal")],
-        [InlineKeyboardButton(text="📋 Список работников", callback_data="admin_list")],
-        [InlineKeyboardButton(text="🔄 Сбросить бонусы", callback_data="admin_reset")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin_back")]
+        [InlineKeyboardButton(text="➕ Добавить работника", callback_data="add_worker")],
+        [InlineKeyboardButton(text="✏️ Изменить имя работника", callback_data="edit_name")],
+        [InlineKeyboardButton(text="💰 Настроить сумму за скриншот", callback_data="set_price")],
+        [InlineKeyboardButton(text="🏦 Пополнить баланс", callback_data="add_balance")],
+        [InlineKeyboardButton(text="📉 Списать с баланса", callback_data="remove_balance")],
+        [InlineKeyboardButton(text="📋 Список работников", callback_data="list_workers")],
+        [InlineKeyboardButton(text="🔄 Сбросить бонусы", callback_data="reset_bonuses")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
     ])
+
 
 # ================= ОБРАБОТЧИКИ =================
 @dp.message(Command("start"))
-async def start(msg: types.Message):
-    kb = main_keyboard(is_admin(msg.from_user.id))
-    await msg.answer("🤖 *Бот учёта прибыли*\n\nOzon / YPay / ЛОГИ", parse_mode="Markdown", reply_markup=kb)
+async def cmd_start(message: types.Message):
+    keyboard = get_main_keyboard(is_admin(message.from_user.id))
+    await message.answer("🤖 Добро пожаловать в бот учёта прибыли!\n\n📌 Выберите действие в меню.",
+                         reply_markup=keyboard)
+
 
 @dp.message(F.text == "👤 Мой профиль")
-async def profile(msg: types.Message):
-    worker = get_worker(msg.from_user.id)
+async def show_profile(message: types.Message):
+    worker = get_worker(message.from_user.id)
     if not worker:
-        await msg.answer("❌ Вы не зарегистрированы!")
+        await message.answer("❌ Вы не зарегистрированы как работник. Обратитесь к администратору.")
         return
-    
-    daily = worker[9] + worker[10] + worker[11]
-    text = f"""📊 *Профиль*
+    await message.answer(
+        f"📊 *Ваш профиль*\n\n"
+        f"👤 Имя: `{worker[1]}`\n"
+        f"💰 Баланс: `{worker[2]:.2f} $`\n"
+        f"💵 Цена за скриншот: `{worker[3]:.2f} $`\n"
+        f"📸 Всего скриншотов: `{worker[4]}`\n"
+        f"📅 Сегодня: `{worker[5]}` скриншотов",
+        parse_mode="Markdown"
+    )
 
-👤 {worker[1]}
-💰 Баланс: {worker[2]:.2f}$
-
-🛍️ *Ozon*
-├ Цена: {worker[3]:.2f}$
-├ Всего: {worker[6]}
-└ Сегодня: {worker[9]}
-
-💳 *YPay*
-├ Цена: {worker[4]:.2f}$
-├ Всего: {worker[7]}
-└ Сегодня: {worker[10]}
-
-📦 *ЛОГИ*
-├ Цена: {worker[5]:.2f}$
-├ Всего: {worker[8]}
-└ Сегодня: {worker[11]}
-
-📅 Сегодня: {daily} скриншотов"""
-    await msg.answer(text, parse_mode="Markdown")
 
 @dp.message(F.text == "📸 Отправить скриншот")
-async def send_screenshot(msg: types.Message, state: FSMContext):
-    if not get_worker(msg.from_user.id):
-        await msg.answer("❌ Вы не зарегистрированы!")
+async def ask_screenshot(message: types.Message):
+    if not get_worker(message.from_user.id):
+        await message.answer("❌ Вы не зарегистрированы как работник.")
         return
-    await msg.answer("📷 Выберите платформу:", reply_markup=platform_keyboard())
-    await state.set_state(SendScreenshot.get_platform)
+    await message.answer("📷 Отправьте фото скриншота:")
 
-@dp.message(SendScreenshot.get_platform)
-async def get_platform(msg: types.Message, state: FSMContext):
-    if msg.text == "◀️ Назад":
-        kb = main_keyboard(is_admin(msg.from_user.id))
-        await msg.answer("🔙 Главное меню", reply_markup=kb)
-        await state.clear()
-        return
-    
-    plat_map = {"🛍️ Ozon": "ozon", "💳 YPay": "ypay", "📦 ЛОГИ": "logi"}
-    if msg.text not in plat_map:
-        await msg.answer("❌ Выберите из кнопок!")
-        return
-    
-    await state.update_data(platform=plat_map[msg.text])
-    await msg.answer(f"Выбрано: {msg.text}\n\nОтправьте фото:", reply_markup=types.ReplyKeyboardRemove())
-    await state.set_state(SendScreenshot.get_photo)
 
-@dp.message(SendScreenshot.get_photo, F.photo)
-async def get_photo(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    platform = data.get("platform")
-    if not platform:
-        await msg.answer("❌ Ошибка! Начните заново /start")
-        await state.clear()
+@dp.message(F.photo)
+async def handle_screenshot(message: types.Message):
+    worker = get_worker(message.from_user.id)
+    if not worker:
+        await message.answer("❌ Вы не зарегистрированы")
         return
-    
-    worker = get_worker(msg.from_user.id)
-    file_id = msg.photo[-1].file_id
-    save_screenshot(msg.from_user.id, platform, file_id)
-    
-    plat_emoji = {"ozon": "🛍️ Ozon", "ypay": "💳 YPay", "logi": "📦 ЛОГИ"}
-    price = get_price(worker, platform)
-    
-    # Отправляем админу
+    file_id = message.photo[-1].file_id
+    save_screenshot(message.from_user.id, file_id)
     for admin_id in ADMIN_IDS:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"ok_{msg.from_user.id}_{platform}")],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no_{msg.from_user.id}_{platform}")]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_{message.from_user.id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{message.from_user.id}")]
         ])
         await bot.send_photo(
             admin_id,
             photo=file_id,
-            caption=f"📸 *Новый скриншот*\n👤 {worker[1]}\n🆔 ID: {msg.from_user.id}\n📱 {plat_emoji[platform]}\n💰 {price:.2f}$",
-            parse_mode="Markdown",
-            reply_markup=kb
+            caption=f"📸 Новый скриншот\n👤 Работник: {worker[1]}\n🆔 ID: {message.from_user.id}",
+            reply_markup=keyboard
         )
-    
-    await msg.answer(f"✅ Скриншот ({plat_emoji[platform]}) отправлен на проверку!")
-    await state.clear()
-    
-    kb = main_keyboard(is_admin(msg.from_user.id))
-    await msg.answer("🔙 Главное меню", reply_markup=kb)
+    await message.answer("✅ Скриншот отправлен на подтверждение!")
 
-@dp.message(SendScreenshot.get_photo)
-async def no_photo(msg: types.Message):
-    await msg.answer("❌ Отправьте ФОТО!")
 
 @dp.message(F.text == "⚙️ Админ-панель")
-async def admin_panel(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        await msg.answer("⛔ Доступ запрещён!")
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Доступ запрещён!")
         return
-    await msg.answer("⚙️ *Админ-панель*", parse_mode="Markdown", reply_markup=admin_keyboard())
+    await message.answer("⚙️ *Админ-панель*\nВыберите действие:", parse_mode="Markdown",
+                         reply_markup=get_admin_panel_keyboard())
 
-# ================= CALLBACK АДМИНА =================
-@dp.callback_query(lambda c: c.data == "admin_add")
-async def admin_add(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("➕ Введите Telegram ID работника:")
-    await state.set_state(AddWorker.get_id)
 
-@dp.callback_query(lambda c: c.data == "admin_name")
-async def admin_name(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("✏️ Введите Telegram ID:")
-    await state.set_state(EditName.get_id)
+# ================= CALLBACK =================
+@dp.callback_query(lambda c: c.data == "add_worker")
+async def add_worker_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("➕ Введите `telegram_id` работника:", parse_mode="Markdown")
+    await state.set_state(AddWorkerState.waiting_for_id)
 
-@dp.callback_query(lambda c: c.data == "admin_price")
-async def admin_price(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("💰 Введите Telegram ID:")
-    await state.set_state(SetPrice.get_id)
 
-@dp.callback_query(lambda c: c.data == "admin_add_bal")
-async def admin_add_bal(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("🏦 Введите Telegram ID:")
-    await state.set_state(AddBalance.get_id)
-
-@dp.callback_query(lambda c: c.data == "admin_rem_bal")
-async def admin_rem_bal(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
-    await call.message.answer("📉 Введите Telegram ID:")
-    await state.set_state(RemoveBalance.get_id)
-
-@dp.callback_query(lambda c: c.data == "admin_list")
-async def admin_list(call: types.CallbackQuery):
-    await call.answer()
+@dp.callback_query(lambda c: c.data == "edit_name")
+async def edit_name_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
     workers = get_all_workers()
     if not workers:
-        await call.message.answer("❌ Нет работников!")
+        await callback.message.answer("❌ Нет работников!")
         return
-    
-    text = "📋 *Список работников*\n\n"
+    text = "📋 *Список работников:*\n\n"
     for w in workers:
-        daily = w[9] + w[10] + w[11]
-        text += f"🆔 `{w[0]}`\n👤 {w[1]}\n💰 {w[2]:.2f}$\n🛍️ {w[3]:.2f}$ | 💳 {w[4]:.2f}$ | 📦 {w[5]:.2f}$\n📸 O:{w[6]} Y:{w[7]} Л:{w[8]}\n📅 Сегодня: {daily}\n{'─' * 25}\n"
-    await call.message.answer(text, parse_mode="Markdown")
+        text += f"🆔 ID: `{w[0]}` | Имя: {w[1]}\n"
+    await callback.message.answer(text + "\n✏️ Введите `telegram_id` работника, чьё имя хотите изменить:",
+                                  parse_mode="Markdown")
+    await state.set_state(EditNameState.waiting_for_worker_id)
 
-@dp.callback_query(lambda c: c.data == "admin_reset")
-async def admin_reset(call: types.CallbackQuery):
-    await call.answer()
-    today = date.today().isoformat()
-    cursor.execute("UPDATE workers SET bonus_4 = 0, bonus_6 = 0, bonus_10 = 0, bonus_date = ?", (today,))
-    conn.commit()
-    await call.message.answer("✅ Бонусы сброшены!")
 
-@dp.callback_query(lambda c: c.data == "admin_back")
-async def admin_back(call: types.CallbackQuery):
-    await call.answer()
-    kb = main_keyboard(True)
-    await call.message.answer("🔙 Главное меню", reply_markup=kb)
-    await call.message.delete()
+@dp.callback_query(lambda c: c.data == "set_price")
+async def set_price_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("💰 Введите `telegram_id` работника:", parse_mode="Markdown")
+    await state.set_state(SetPriceState.waiting_for_worker_id)
 
-# ================= ПОДТВЕРЖДЕНИЕ =================
-@dp.callback_query(lambda c: c.data.startswith("ok_"))
-async def approve(call: types.CallbackQuery):
-    parts = call.data.split("_")
-    uid = int(parts[1])
-    platform = parts[2]
-    
-    pending = get_pending(uid, platform)
-    if not pending:
-        await call.answer("❌ Нет скриншота!")
+
+@dp.callback_query(lambda c: c.data == "list_workers")
+async def list_workers(callback: types.CallbackQuery):
+    await callback.answer()
+    workers = get_all_workers()
+    if not workers:
+        await callback.message.answer("❌ Нет работников!")
         return
-    
-    approve_screenshot(pending[0])
-    worker = get_worker(uid)
-    price = get_price(worker, platform)
-    
-    add_balance(uid, price)
-    inc_screenshot(uid, platform)
-    bonus = check_bonus(uid)
-    
-    plat_emoji = {"ozon": "🛍️ Ozon", "ypay": "💳 YPay", "logi": "📦 ЛОГИ"}
-    await bot.send_message(uid, f"✅ Скриншот ({plat_emoji[platform]}) подтверждён!\n💰 +{price:.2f}$\n{bonus}")
-    
-    await call.answer("✅ Подтверждён!")
-    await call.message.edit_caption(caption=f"✅ ПОДТВЕРЖДЁН\n{call.message.caption}", reply_markup=None)
+    text = "📋 *Список работников:*\n\n"
+    for w in workers:
+        text += (
+            f"🆔 ID: `{w[0]}`\n"
+            f"👤 Имя: {w[1]}\n"
+            f"💰 Баланс: {w[2]:.2f} $\n"
+            f"💵 Цена: {w[3]:.2f} $\n"
+            f"📸 Всего: {w[4]} | Сегодня: {w[5]}\n"
+            f"{'─' * 25}\n"
+        )
+    await callback.message.answer(text, parse_mode="Markdown")
 
-@dp.callback_query(lambda c: c.data.startswith("no_"))
-async def reject(call: types.CallbackQuery):
-    parts = call.data.split("_")
-    uid = int(parts[1])
-    platform = parts[2]
-    
-    pending = get_pending(uid, platform)
-    if pending:
-        reject_screenshot(pending[0])
-        plat_emoji = {"ozon": "🛍️ Ozon", "ypay": "💳 YPay", "logi": "📦 ЛОГИ"}
-        await bot.send_message(uid, f"❌ Скриншот ({plat_emoji[platform]}) отклонён!")
-    
-    await call.answer("❌ Отклонён!")
-    await call.message.edit_caption(caption=f"❌ ОТКЛОНЁН\n{call.message.caption}", reply_markup=None)
 
-# ================= FSM ДОБАВЛЕНИЕ РАБОТНИКА =================
-@dp.message(AddWorker.get_id)
-async def add_get_id(msg: types.Message, state: FSMContext):
+@dp.callback_query(lambda c: c.data == "add_balance")
+async def add_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("🏦 Введите `telegram_id` работника для пополнения:", parse_mode="Markdown")
+    await state.set_state(AddBalanceState.waiting_for_worker_id)
+
+
+@dp.callback_query(lambda c: c.data == "remove_balance")
+async def remove_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.answer("📉 Введите `telegram_id` работника для списания:", parse_mode="Markdown")
+    await state.set_state(RemoveBalanceState.waiting_for_worker_id)
+
+
+@dp.callback_query(lambda c: c.data == "reset_bonuses")
+async def reset_bonuses_manual(callback: types.CallbackQuery):
+    await callback.answer()
+    reset_daily_stats()
+    await callback.message.answer("✅ Дневные бонусы и счётчики сброшены у всех работников!")
+
+
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.answer("🔙 Главное меню", reply_markup=get_main_keyboard(True))
+    await callback.message.delete()
+
+
+@dp.callback_query(lambda c: c.data.startswith("approve_"))
+async def approve_screenshot_callback(callback: types.CallbackQuery):
+    worker_id = int(callback.data.split("_")[1])
+    cursor.execute(
+        "SELECT id FROM screenshots WHERE worker_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        (worker_id,))
+    result = cursor.fetchone()
+    if not result:
+        await callback.answer("❌ Нет ожидающих скриншотов!")
+        return
+    approve_screenshot(result[0])
+    worker = get_worker(worker_id)
+    price = worker[3]
+    add_balance(worker_id, price)
+    increment_screenshots(worker_id)
+    bonus_msg = check_and_give_bonuses(worker_id)
+
+    await bot.send_message(
+        worker_id,
+        f"✅ Ваш скриншот подтверждён!\n💰 Начислено: +{price}$\n{bonus_msg}"
+    )
+    await callback.answer("✅ Скриншот подтверждён!")
+    await callback.message.edit_caption(caption=f"✅ ПОДТВЕРЖДЁН\n{callback.message.caption}", reply_markup=None)
+
+
+@dp.callback_query(lambda c: c.data.startswith("reject_"))
+async def reject_screenshot_callback(callback: types.CallbackQuery):
+    worker_id = int(callback.data.split("_")[1])
+    cursor.execute(
+        "SELECT id FROM screenshots WHERE worker_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        (worker_id,))
+    result = cursor.fetchone()
+    if result:
+        reject_screenshot(result[0])
+        await bot.send_message(worker_id, "❌ Ваш скриншот отклонён администратором.")
+    await callback.answer("❌ Скриншот отклонён!")
+    await callback.message.edit_caption(caption=f"❌ ОТКЛОНЁН\n{callback.message.caption}", reply_markup=None)
+
+
+# ================= FSM ОБРАБОТЧИКИ =================
+@dp.message(AddWorkerState.waiting_for_id)
+async def add_worker_get_id(message: types.Message, state: FSMContext):
     try:
-        uid = int(msg.text.strip())
-        if get_worker(uid):
-            await msg.answer("❌ Уже существует!")
-            await state.clear()
-            return
-        await state.update_data(uid=uid)
-        await msg.answer("💰 Цена для Ozon (в $):")
-        await state.set_state(AddWorker.get_ozon)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        worker_id = int(message.text.strip())
+        await state.update_data(worker_id=worker_id)
+        await message.answer("💰 Введите цену за 1 скриншот (в $, например: 0.5):")
+        await state.set_state(AddWorkerState.waiting_for_price)
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО (telegram_id)!")
 
-@dp.message(AddWorker.get_ozon)
-async def add_get_ozon(msg: types.Message, state: FSMContext):
-    try:
-        p = float(msg.text.replace(",", "."))
-        await state.update_data(ozon=p)
-        await msg.answer("💰 Цена для YPay (в $):")
-        await state.set_state(AddWorker.get_ypay)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
 
-@dp.message(AddWorker.get_ypay)
-async def add_get_ypay(msg: types.Message, state: FSMContext):
+@dp.message(AddWorkerState.waiting_for_price)
+async def add_worker_get_price(message: types.Message, state: FSMContext):
     try:
-        p = float(msg.text.replace(",", "."))
-        await state.update_data(ypay=p)
-        await msg.answer("💰 Цена для ЛОГИ (в $):")
-        await state.set_state(AddWorker.get_logi)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
-
-@dp.message(AddWorker.get_logi)
-async def add_get_logi(msg: types.Message, state: FSMContext):
-    try:
-        p_logi = float(msg.text.replace(",", "."))
+        price = float(message.text.replace(",", "."))
         data = await state.get_data()
-        uid = data["uid"]
-        p_ozon = data["ozon"]
-        p_ypay = data["ypay"]
-        
-        add_worker(uid, f"User_{uid}", p_ozon, p_ypay, p_logi)
-        await msg.answer(f"✅ Работник добавлен!\n🆔 {uid}\n🛍️ {p_ozon:.2f}$\n💳 {p_ypay:.2f}$\n📦 {p_logi:.2f}$")
-        await state.clear()
-        
-        try:
-            await bot.send_message(uid, f"🎉 Вас добавили!\n🛍️ {p_ozon:.2f}$\n💳 {p_ypay:.2f}$\n📦 {p_logi:.2f}$")
-        except:
-            pass
-    except:
-        await msg.answer("❌ Ошибка!")
-
-# ================= FSM РЕДАКТИРОВАНИЕ ИМЕНИ =================
-@dp.message(EditName.get_id)
-async def edit_name_id(msg: types.Message, state: FSMContext):
-    try:
-        uid = int(msg.text.strip())
-        if not get_worker(uid):
-            await msg.answer("❌ Не найден!")
+        worker_id = data["worker_id"]
+        if get_worker(worker_id):
+            await message.answer(f"❌ Работник с ID {worker_id} уже существует!")
             await state.clear()
             return
-        await state.update_data(uid=uid)
-        await msg.answer("✏️ Введите новое имя:")
-        await state.set_state(EditName.get_name)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        full_name = message.from_user.full_name
+        add_worker(worker_id, full_name, price)
+        await message.answer(f"✅ Работник добавлен!\n🆔 ID: {worker_id}\n👤 Имя: {full_name}\n💰 Цена: {price:.2f}$")
+        await state.clear()
+        await bot.send_message(worker_id, f"🎉 Вас добавили как работника!\n💰 Ваша цена за скриншот: {price:.2f}$")
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО (цену в $)!")
 
-@dp.message(EditName.get_name)
-async def edit_name_set(msg: types.Message, state: FSMContext):
+
+@dp.message(EditNameState.waiting_for_worker_id)
+async def edit_name_get_worker(message: types.Message, state: FSMContext):
+    try:
+        worker_id = int(message.text.strip())
+        worker = get_worker(worker_id)
+        if not worker:
+            await message.answer(f"❌ Работник с ID {worker_id} не найден!")
+            await state.clear()
+            return
+        await state.update_data(worker_id=worker_id)
+        await message.answer(f"✏️ Текущее имя: {worker[1]}\nВведите новое имя для работника:")
+        await state.set_state(EditNameState.waiting_for_new_name)
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО (telegram_id)!")
+
+
+@dp.message(EditNameState.waiting_for_new_name)
+async def edit_name_get_new_name(message: types.Message, state: FSMContext):
+    new_name = message.text.strip()
     data = await state.get_data()
-    update_name(data["uid"], msg.text.strip())
-    await msg.answer(f"✅ Имя изменено на: {msg.text}")
+    worker_id = data["worker_id"]
+    update_worker_name(worker_id, new_name)
+    await message.answer(f"✅ Имя работника изменено на: {new_name}")
     await state.clear()
+    await bot.send_message(worker_id, f"✏️ Админ изменил ваше имя на: {new_name}")
 
-# ================= FSM НАСТРОЙКА ЦЕНЫ =================
-@dp.message(SetPrice.get_id)
-async def price_get_id(msg: types.Message, state: FSMContext):
+
+@dp.message(SetPriceState.waiting_for_worker_id)
+async def set_price_get_worker(message: types.Message, state: FSMContext):
     try:
-        uid = int(msg.text.strip())
-        if not get_worker(uid):
-            await msg.answer("❌ Не найден!")
+        worker_id = int(message.text.strip())
+        worker = get_worker(worker_id)
+        if not worker:
+            await message.answer(f"❌ Работник с ID {worker_id} не найден!")
             await state.clear()
             return
-        await state.update_data(uid=uid)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛍️ Ozon", callback_data="pr_ozon"),
-             InlineKeyboardButton(text="💳 YPay", callback_data="pr_ypay")],
-            [InlineKeyboardButton(text="📦 ЛОГИ", callback_data="pr_logi")]
-        ])
-        await msg.answer("Выберите платформу:", reply_markup=kb)
-        await state.set_state(SetPrice.get_platform)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await state.update_data(worker_id=worker_id)
+        await message.answer(f"💰 Текущая цена для {worker[1]}: {worker[3]:.2f}$\nВведите новую цену:")
+        await state.set_state(SetPriceState.waiting_for_new_price)
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-@dp.callback_query(lambda c: c.data.startswith("pr_"))
-async def price_platform(call: types.CallbackQuery, state: FSMContext):
-    plat = call.data.split("_")[1]
-    await state.update_data(platform=plat)
-    await call.message.answer(f"💰 Введите новую цену для {plat.upper()}:")
-    await state.set_state(SetPrice.get_price)
-    await call.answer()
 
-@dp.message(SetPrice.get_price)
-async def price_set(msg: types.Message, state: FSMContext):
+@dp.message(SetPriceState.waiting_for_new_price)
+async def set_price_get_new_price(message: types.Message, state: FSMContext):
     try:
-        price = float(msg.text.replace(",", "."))
+        new_price = float(message.text.replace(",", "."))
         data = await state.get_data()
-        update_price(data["uid"], data["platform"], price)
-        await msg.answer(f"✅ Цена обновлена: {price:.2f}$")
+        worker_id = data["worker_id"]
+        update_worker_price(worker_id, new_price)
+        worker = get_worker(worker_id)
+        await message.answer(f"✅ Цена для {worker[1]} обновлена: {new_price:.2f}$")
         await state.clear()
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await bot.send_message(worker_id, f"💰 Админ обновил цену за скриншот: теперь {new_price:.2f}$")
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-# ================= FSM ПОПОЛНЕНИЕ =================
-@dp.message(AddBalance.get_id)
-async def add_bal_id(msg: types.Message, state: FSMContext):
+
+@dp.message(AddBalanceState.waiting_for_worker_id)
+async def add_balance_get_worker(message: types.Message, state: FSMContext):
     try:
-        uid = int(msg.text.strip())
-        if not get_worker(uid):
-            await msg.answer("❌ Не найден!")
+        worker_id = int(message.text.strip())
+        worker = get_worker(worker_id)
+        if not worker:
+            await message.answer(f"❌ Работник с ID {worker_id} не найден!")
             await state.clear()
             return
-        await state.update_data(uid=uid)
-        await msg.answer("💰 Введите сумму (+$):")
-        await state.set_state(AddBalance.get_amount)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await state.update_data(worker_id=worker_id)
+        await message.answer(f"💰 Текущий баланс {worker[1]}: {worker[2]:.2f}$\nВведите сумму пополнения (+$):")
+        await state.set_state(AddBalanceState.waiting_for_amount)
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-@dp.message(AddBalance.get_amount)
-async def add_bal_set(msg: types.Message, state: FSMContext):
+
+@dp.message(AddBalanceState.waiting_for_amount)
+async def add_balance_get_amount(message: types.Message, state: FSMContext):
     try:
-        amount = float(msg.text.replace(",", "."))
+        amount = float(message.text.replace(",", "."))
         data = await state.get_data()
-        add_balance(data["uid"], amount)
-        worker = get_worker(data["uid"])
-        await msg.answer(f"✅ Пополнено на {amount:.2f}$\n💰 Новый баланс: {worker[2]:.2f}$")
+        worker_id = data["worker_id"]
+        add_balance(worker_id, amount)
+        worker = get_worker(worker_id)
+        await message.answer(f"✅ Баланс пополнен на {amount:.2f}$\n💰 Новый баланс: {worker[2]:.2f}$")
         await state.clear()
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await bot.send_message(worker_id, f"💰 Админ пополнил баланс на +{amount:.2f}$\n📊 Ваш баланс: {worker[2]:.2f}$")
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-# ================= FSM СПИСАНИЕ =================
-@dp.message(RemoveBalance.get_id)
-async def rem_bal_id(msg: types.Message, state: FSMContext):
+
+@dp.message(RemoveBalanceState.waiting_for_worker_id)
+async def remove_balance_get_worker(message: types.Message, state: FSMContext):
     try:
-        uid = int(msg.text.strip())
-        if not get_worker(uid):
-            await msg.answer("❌ Не найден!")
+        worker_id = int(message.text.strip())
+        worker = get_worker(worker_id)
+        if not worker:
+            await message.answer(f"❌ Работник с ID {worker_id} не найден!")
             await state.clear()
             return
-        await state.update_data(uid=uid)
-        await msg.answer("📉 Введите сумму для списания (-$):")
-        await state.set_state(RemoveBalance.get_amount)
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await state.update_data(worker_id=worker_id)
+        await message.answer(f"💰 Текущий баланс {worker[1]}: {worker[2]:.2f}$\nВведите сумму для СПИСАНИЯ (-$):")
+        await state.set_state(RemoveBalanceState.waiting_for_amount)
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-@dp.message(RemoveBalance.get_amount)
-async def rem_bal_set(msg: types.Message, state: FSMContext):
+
+@dp.message(RemoveBalanceState.waiting_for_amount)
+async def remove_balance_get_amount(message: types.Message, state: FSMContext):
     try:
-        amount = float(msg.text.replace(",", "."))
+        amount = float(message.text.replace(",", "."))
         data = await state.get_data()
-        remove_balance(data["uid"], amount)
-        worker = get_worker(data["uid"])
-        await msg.answer(f"✅ Списано {amount:.2f}$\n💰 Новый баланс: {worker[2]:.2f}$")
+        worker_id = data["worker_id"]
+        remove_balance(worker_id, amount)
+        worker = get_worker(worker_id)
+        await message.answer(f"✅ Списано {amount:.2f}$\n💰 Новый баланс: {worker[2]:.2f}$")
         await state.clear()
-    except:
-        await msg.answer("❌ Введите ЧИСЛО!")
+        await bot.send_message(worker_id, f"📉 Админ списал с баланса -{amount:.2f}$\n📊 Ваш баланс: {worker[2]:.2f}$")
+    except ValueError:
+        await message.answer("❌ Введите ЧИСЛО!")
 
-# ================= ЕЖЕДНЕВНЫЙ СБРОС =================
-async def daily_reset_job():
+
+# ================= ФОНОВАЯ ЗАДАЧА =================
+async def daily_reset_task():
     while True:
         now = datetime.now()
-        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        await asyncio.sleep((midnight - now).total_seconds())
-        cursor.execute("UPDATE workers SET daily_ozon = 0, daily_ypay = 0, daily_logi = 0")
-        conn.commit()
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep((next_midnight - now).total_seconds())
+        reset_daily_stats()
         for admin_id in ADMIN_IDS:
-            await bot.send_message(admin_id, "🔄 *Ежедневный сброс выполнен!*", parse_mode="Markdown")
+            try:
+                await bot.send_message(admin_id,
+                                       "🔄 *Ежедневный сброс бонусов выполнен!*\n\nРаботники могут снова получать бонусы за 4, 6 и 10 скриншотов за сегодня.",
+                                       parse_mode="Markdown")
+            except:
+                pass
+
 
 # ================= ЗАПУСК =================
 async def main():
-    asyncio.create_task(daily_reset_job())
-    print("🤖 Бот запущен!")
-    print(f"👑 Админы: {ADMIN_IDS}")
+    asyncio.create_task(daily_reset_task())
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
+    print("🤖 Бот запущен!")
+    print(f"👑 Админы: {ADMIN_IDS}")
+    print("⏰ Ежедневный сброс бонусов в 00:00")
+    print("📌 Новые функции: Изменение имени | Списание баланса")
     asyncio.run(main())
